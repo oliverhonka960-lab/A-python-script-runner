@@ -1,0 +1,28 @@
+# 🎮 Steam-Style Python Launcher
+
+A modern, open-source **Steam Big Picture–style launcher** for Python projects, built entirely in **Python** with controller support, fade animations, and a vertical carousel UI.
+
+![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)
+![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
+
+---
+
+## ✨ Features
+
+- 🎨 Steam-like animated interface
+- 🕹️ Semi controller support
+- ⚙️ Settings menu (dark mode, theme options)
+- 🧩 Add / remove Python scripts directly from the launcher
+- 💬 Integrated live output console
+- 🖱️ Mouse and keyboard navigation
+- 📁 Auto-detects `.py` scripts in your directory
+
+---
+
+## 🚀 Installation
+
+1. Clone this repository:
+   ```bash
+   git clone https://github.com/<your-username>/python-launcher.git
+   cd python-launcher
