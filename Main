@@ -1,20 +1,3 @@
-#!/usr/bin/env python3
-"""
-big_picture_complete.py
-
-A single-file Steam Big Picture–style launcher using pygame.
-
-Features:
- - Fullscreen vertical carousel that scrolls smoothly
- - Fade/scale effects for items out of focus
- - Controller (gamepad) and keyboard navigation
- - Add and remove Python scripts from the UI
- - Settings menu (toggle fullscreen, theme)
- - Live subprocess stdout/stderr logging overlay
- - Persistent settings (last selected, theme, fullscreen)
- - Self-contained, safe defaults, and structured to avoid Python scoping errors
-"""
-
 import os
 import sys
 import pygame
