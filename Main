@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""
+big_picture_complete.py
+
+A single-file Steam Big Picture–style launcher using pygame.
+
+Features:
+ - Fullscreen vertical carousel that scrolls smoothly
+ - Fade/scale effects for items out of focus
+ - Controller (gamepad) and keyboard navigation
+ - Add and remove Python scripts from the UI
+ - Settings menu (toggle fullscreen, theme)
+ - Live subprocess stdout/stderr logging overlay
+ - Persistent settings (last selected, theme, fullscreen)
+ - Self-contained, safe defaults, and structured to avoid Python scoping errors
+"""
+
+import os
+import sys
+import pygame
+import pygame.freetype
+import threading
+import subprocess
+import time
+import json
+import math
+import shutil
+from pathlib import Path
+from pygame.locals import *
+from tkinter import Tk, filedialog
+
+# ------------------------- Configuration -------------------------
+BASE_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = BASE_DIR / "scripts"
+COVERS_DIR = BASE_DIR / "covers"
+SETTINGS_FILE = BASE_DIR / "bp_settings.json"
+
+FPS = 60
+ITEM_W, ITEM_H = 520, 260
+ITEM_SPACING = 36
+FADE_DISTANCE = 450
+LOG_MAX_LINES = 400
+ANIM_LERP = 0.14
+CONTROLLER_REPEAT = 0.20
+
+# Ensure folders exist
+SCRIPTS_DIR.mkdir(exist_ok=True)
+COVERS_DIR.mkdir(exist_ok=True)
+
+# ------------------------- Utility -------------------------
+def load_json(path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf8"))
+    except Exception:
+        pass
+    return default
+
+def save_json(path, data):
+    try:
+        path.write_text(json.dumps(data, indent=2), encoding="utf8")
+    except Exception:
+        pass
+
+# ------------------------- Script Item -------------------------
+class ScriptItem:
+    def __init__(self, path: Path, target_size=(ITEM_W, ITEM_H)):
+        self.path = path
+        self.name = path.stem
+        self.display = path.name
+        self.cover = None
+        cover_path = COVERS_DIR / (self.name + ".png")
+        if cover_path.exists():
+            try:
+                img = pygame.image.load(str(cover_path)).convert_alpha()
+                self.cover = pygame.transform.smoothscale(img, target_size)
+            except Exception:
+                self.cover = None
+
+# ------------------------- Process Runner -------------------------
+class ProcessRunner:
+    def __init__(self, max_lines=LOG_MAX_LINES):
+        self.proc = None
+        self.lines = []
+        self.lock = threading.Lock()
+        self.thread = None
+        self.alive = False
+        self.max_lines = max_lines
+
+    def start(self, python_exe, script_path, args=()):
+        if self.alive:
+            return False
+        cmd = [python_exe or sys.executable, str(script_path)] + list(args)
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL
+            )
+        except Exception as e:
+            self.append(f"Failed to start: {e}", err=True)
+            return False
+        self.alive = True
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+        return True
+
+    def _reader(self):
+        def read_stream(stream, err=False):
+            for raw in iter(stream.readline, b''):
+                try:
+                    text = raw.decode('utf-8', errors='replace')
+                except Exception:
+                    text = raw.decode('latin1', errors='replace')
+                self.append(text.rstrip("\n"), err=err)
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+        out = self.proc.stdout
+        err = self.proc.stderr
+        t1 = threading.Thread(target=read_stream, args=(out, False), daemon=True)
+        t2 = threading.Thread(target=read_stream, args=(err, True), daemon=True)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        try:
+            code = self.proc.wait()
+        except Exception:
+            code = -1
+        self.append(f"[Process exited with code {code}]")
+        self.alive = False
+
+    def append(self, text, err=False):
+        with self.lock:
+            prefix = "[ERR] " if err else ""
+            ts = time.strftime("%H:%M:%S")
+            self.lines.append(f"{ts} {prefix}{text}")
+            if len(self.lines) > self.max_lines:
+                self.lines = self.lines[-self.max_lines:]
+
+    def stop(self):
+        if self.proc and self.alive:
+            try:
+                self.proc.terminate()
+                time.sleep(0.18)
+                if self.proc.poll() is None:
+                    self.proc.kill()
+            except Exception as e:
+                self.append(f"Stop error: {e}", err=True)
+        self.alive = False
+
+    def get_lines(self, n=None):
+        with self.lock:
+            if n is None:
+                return list(self.lines)
+            return list(self.lines[-n:])
+
+# ------------------------- Launcher App -------------------------
+class BigPictureLauncher:
+    def __init__(self):
+        pygame.init()
+        pygame.joystick.init()
+        pygame.freetype.init()
+
+        self.info = pygame.display.Info()
+        self.default_size = (1200, 720)
+        # Load settings
+        self.settings = load_json(SETTINGS_FILE, {"last_selected": None, "theme": "dark", "fullscreen": True})
+        self.fullscreen = bool(self.settings.get("fullscreen", True))
+        self.theme_dark = (self.settings.get("theme", "dark") == "dark")
+        # Setup display
+        flags = FULLSCREEN if self.fullscreen else RESIZABLE
+        self.screen = pygame.display.set_mode((self.info.current_w, self.info.current_h), flags)
+        pygame.display.set_caption("Big Picture Launcher")
+        # Fonts
+        try:
+            self.font = pygame.freetype.SysFont("Segoe UI", 22)
+            self.font_big = pygame.freetype.SysFont("Segoe UI", 36)
+            self.font_small = pygame.freetype.SysFont("Segoe UI", 16)
+        except Exception:
+            self.font = pygame.freetype.SysFont(None, 22)
+            self.font_big = pygame.freetype.SysFont(None, 36)
+            self.font_small = pygame.freetype.SysFont(None, 16)
+        # Colors
+        self.colors = self._get_colors()
+        # State
+        self.items = self.scan_scripts()
+        self.selected_index = 0
+        if self.settings.get("last_selected"):
+            self._restore_last_selected()
+        self.scroll_y = 0.0
+        self.target_scroll = 0.0
+        self.runner = ProcessRunner()
+        self.running = True
+        self.clock = pygame.time.Clock()
+        self.joysticks = []
+        self._init_controllers()
+        self.last_nav_time = 0.0
+        self.in_settings = False
+        self.settings_index = 0
+        self.settings_options = ["Toggle Fullscreen", "Toggle Theme", "Delete All Scripts", "Back"]
+        # Input text for optional args
+        self.args_text = ""
+        self.python_path = ""
+        # UI constants
+        self.center_x = self.screen.get_width() // 2
+        self.center_y = self.screen.get_height() // 2
+        # Placeholder icon
+        self.placeholder = pygame.Surface((ITEM_W, ITEM_H), pygame.SRCALPHA)
+        self.placeholder.fill((40, 50, 60))
+        self.font_big.render_to(self.placeholder, (20, ITEM_H//2 - 20), "PY", (190, 210, 255))
+        # Misc
+        self.last_time = time.time()
+        # Ensure items not empty selection bounds
+        if self.items and (self.selected_index < 0 or self.selected_index >= len(self.items)):
+            self.selected_index = 0
+
+    def _get_colors(self):
+        if self.theme_dark:
+            return {
+                "bg": (12, 16, 20),
+                "panel": (22, 26, 32),
+                "highlight": (70, 150, 255),
+                "text": (220, 220, 225),
+                "muted": (120, 130, 140)
+            }
+        else:
+            return {
+                "bg": (240, 242, 245),
+                "panel": (210, 214, 220),
+                "highlight": (30, 90, 180),
+                "text": (20, 22, 28),
+                "muted": (100, 100, 110)
+            }
+
+    def _init_controllers(self):
+        for i in range(pygame.joystick.get_count()):
+            try:
+                js = pygame.joystick.Joystick(i)
+                js.init()
+                self.joysticks.append(js)
+            except Exception:
+                pass
+
+    def scan_scripts(self):
+        return [ScriptItem(p) for p in sorted(SCRIPTS_DIR.glob("*.py"))]
+
+    def _restore_last_selected(self):
+        last = self.settings.get("last_selected")
+        if not last:
+            return
+        for idx, it in enumerate(self.items):
+            try:
+                if str(it.path) == str(last):
+                    self.selected_index = idx
+                    return
+            except Exception:
+                pass
+
+    # ------------------------- UI helpers -------------------------
+    def draw_rounded_rect(self, surf, rect, color, r=18):
+        x, y, w, h = rect
+        pygame.draw.rect(surf, color, (x + r, y, w - 2 * r, h))
+        pygame.draw.rect(surf, color, (x, y + r, w, h - 2 * r))
+        pygame.draw.circle(surf, color, (x + r, y + r), r)
+        pygame.draw.circle(surf, color, (x + w - r, y + r), r)
+        pygame.draw.circle(surf, color, (x + r, y + h - r), r)
+        pygame.draw.circle(surf, color, (x + w - r, y + h - r), r)
+
+    def draw_text_center(self, surf, text, pos, font, color):
+        rect = font.get_rect(text)
+        rect.center = pos
+        font.render_to(surf, rect, text, color)
+
+    # ------------------------- Core actions -------------------------
+    def add_script_dialog(self):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        files = filedialog.askopenfilenames(title="Select Python script(s) to add", filetypes=[("Python files", "*.py")])
+        root.destroy()
+        if not files:
+            return
+        for f in files:
+            try:
+                src = Path(f)
+                dst = SCRIPTS_DIR / src.name
+                if dst.exists():
+                    # keep existing, create new name
+                    dst = SCRIPTS_DIR / f"{src.stem}_{int(time.time())}{src.suffix}"
+                shutil.copy2(src, dst)
+            except Exception as e:
+                print("Add error:", e)
+        self.items = self.scan_scripts()
+        # select first of added files if any
+        if files:
+            try:
+                first = Path(files[0]).name
+                for i, it in enumerate(self.items):
+                    if it.path.name == first:
+                        self.selected_index = i
+                        break
+            except Exception:
+                pass
+
+    def remove_selected(self):
+        if not self.items:
+            return
+        it = self.items[self.selected_index]
+        try:
+            it.path.unlink(missing_ok=True)
+            cover = COVERS_DIR / (it.name + ".png")
+            if cover.exists():
+                cover.unlink(missing_ok=True)
+        except Exception as e:
+            print("Remove failed:", e)
+        self.items = self.scan_scripts()
+        if self.selected_index >= len(self.items):
+            self.selected_index = max(0, len(self.items) - 1)
+
+    def delete_all_scripts(self):
+        for it in list(self.items):
+            try:
+                it.path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                c = COVERS_DIR / (it.name + ".png")
+                if c.exists():
+                    c.unlink(missing_ok=True)
+            except Exception:
+                pass
+        self.items = self.scan_scripts()
+        self.selected_index = 0
+
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        flags = FULLSCREEN if self.fullscreen else RESIZABLE
+        self.screen = pygame.display.set_mode((self.info.current_w, self.info.current_h), flags)
+        self.settings["fullscreen"] = self.fullscreen
+        save_json(SETTINGS_FILE, self.settings)
+
+    def toggle_theme(self):
+        self.theme_dark = not self.theme_dark
+        self.colors = self._get_colors()
+        self.settings["theme"] = "dark" if self.theme_dark else "light"
+        save_json(SETTINGS_FILE, self.settings)
+
+    def launch_selected(self):
+        if not self.items:
+            return
+        selected = self.items[self.selected_index]
+        # stop any running first
+        try:
+            self.runner.stop()
+        except Exception:
+            pass
+        self.runner = ProcessRunner(max_lines=LOG_MAX_LINES)
+        # no custom args in this simplified UI; use system Python
+        self.runner.start(self.python_path or sys.executable, selected.path, args=())
+
+    # ------------------------- Input handling -------------------------
+    def handle_keydown(self, key):
+        if self.in_settings:
+            if key == K_UP:
+                self.settings_index = (self.settings_index - 1) % len(self.settings_options)
+            elif key == K_DOWN:
+                self.settings_index = (self.settings_index + 1) % len(self.settings_options)
+            elif key in (K_RETURN, K_SPACE):
+                opt = self.settings_options[self.settings_index]
+                if opt == "Toggle Fullscreen":
+                    self.toggle_fullscreen()
+                elif opt == "Toggle Theme":
+                    self.toggle_theme()
+                elif opt == "Delete All Scripts":
+                    self.delete_all_scripts()
+                elif opt == "Back":
+                    self.in_settings = False
+        else:
+            if key == K_ESCAPE:
+                if self.runner.alive:
+                    self.runner.stop()
+                else:
+                    self.running = False
+            elif key in (K_RETURN, K_SPACE):
+                self.launch_selected()
+            elif key == K_F11:
+                self.toggle_fullscreen()
+            elif key == K_a:
+                self.add_script_dialog()
+            elif key == K_r:
+                self.remove_selected()
+            elif key == K_s:
+                self.in_settings = True
+            elif key == K_DELETE:
+                self.delete_all_scripts()
+            elif key == K_UP:
+                self.selected_index = max(0, self.selected_index - 1)
+            elif key == K_DOWN:
+                self.selected_index = min(max(0, len(self.items) - 1), self.selected_index + 1)
+
+    def handle_joy_button(self, button):
+        if self.in_settings:
+            if button == 0:  # A
+                opt = self.settings_options[self.settings_index]
+                if opt == "Toggle Fullscreen":
+                    self.toggle_fullscreen()
+                elif opt == "Toggle Theme":
+                    self.toggle_theme()
+                elif opt == "Delete All Scripts":
+                    self.delete_all_scripts()
+                elif opt == "Back":
+                    self.in_settings = False
+            elif button == 1:  # B
+                self.in_settings = False
+        else:
+            if button == 0:  # A / Cross
+                self.launch_selected()
+            elif button == 1:  # B / Circle
+                if self.runner.alive:
+                    self.runner.stop()
+                else:
+                    self.running = False
+            elif button == 2:  # X / Square
+                self.remove_selected()
+            elif button == 3:  # Y / Triangle
+                self.in_settings = True
+            elif button == 7:  # Start
+                self.add_script_dialog()
+
+    def handle_hat(self, value):
+        # value is (x, y)
+        if not self.in_settings:
+            if value[1] == 1:
+                self.selected_index = max(0, self.selected_index - 1)
+            elif value[1] == -1:
+                if len(self.items) > 0:
+                    self.selected_index = min(len(self.items) - 1, self.selected_index + 1)
+
+    def handle_axis(self, axis, value):
+        # vertical axis often 1 for up/down on many controllers
+        now = time.time()
+        if abs(value) < 0.6:
+            return
+        if now - self.last_nav_time < CONTROLLER_REPEAT:
+            return
+        if axis == 1:  # left stick vertical
+            if value < 0:
+                self.selected_index = max(0, self.selected_index - 1)
+            else:
+                if len(self.items) > 0:
+                    self.selected_index = min(len(self.items) - 1, self.selected_index + 1)
+            self.last_nav_time = now
+
+    # ------------------------- Rendering -------------------------
+    def update_scroll(self):
+        if not self.items:
+            self.target_scroll = 0.0
+        else:
+            self.target_scroll = self.selected_index * (ITEM_H + ITEM_SPACING)
+        # lerp scroll_y toward target
+        self.scroll_y += (self.target_scroll - self.scroll_y) * ANIM_LERP
+
+    def render_carousel(self):
+        w, h = self.screen.get_size()
+        cx = w // 2
+        cy = h // 2
+        base_y = cy - self.scroll_y
+        for idx, item in enumerate(self.items):
+            y = base_y + idx * (ITEM_H + ITEM_SPACING)
+            dist = abs(y - cy)
+            fade_ratio = max(0.0, min(1.0, (dist / FADE_DISTANCE)))
+            alpha = int(max(40, 255 * (1.0 - fade_ratio)))
+            scale = 1.0 - min(0.28, (dist / FADE_DISTANCE) * 0.28)
+            img = item.cover or self.placeholder
+            try:
+                scaled = pygame.transform.smoothscale(img, (max(1, int(ITEM_W * scale)), max(1, int(ITEM_H * scale))))
+            except Exception:
+                scaled = pygame.transform.scale(img, (max(1, int(ITEM_W * scale)), max(1, int(ITEM_H * scale))))
+            rect = scaled.get_rect(center=(cx, int(y)))
+            # background glow for selected
+            if idx == self.selected_index:
+                glow_rect = rect.inflate(10, 12)
+                self.draw_rounded_rect(self.screen, glow_rect, self.colors["highlight"], r=18)
+            # apply alpha
+            img_copy = scaled.copy()
+            img_copy.set_alpha(alpha)
+            self.screen.blit(img_copy, rect)
+            # label for selected item
+            if idx == self.selected_index:
+                self.font_big.render_to(self.screen, (rect.left + 6, rect.bottom + 8), item.display, self.colors["text"])
+
+    def render_right_pane(self):
+        w, h = self.screen.get_size()
+        pane_w = min(520, w // 4 + 40)
+        pane_x = w - pane_w - 40
+        pane_y = 80
+        pane_h = h - pane_y - 60
+        rect = (pane_x, pane_y, pane_w, pane_h)
+        self.draw_rounded_rect(self.screen, rect, self.colors["panel"], r=14)
+        # details
+        if self.items:
+            cur = self.items[self.selected_index]
+            self.font_big.render_to(self.screen, (pane_x + 18, pane_y + 18), cur.name, self.colors["text"])
+            self.font.render_to(self.screen, (pane_x + 18, pane_y + 66), f"Path: {str(cur.path)}", self.colors["muted"])
+            # action hints
+            ay = pane_y + 118
+            self.font.render_to(self.screen, (pane_x + 18, ay), "Enter / A → Launch", self.colors["text"])
+            self.font.render_to(self.screen, (pane_x + 18, ay + 26), "R / X → Remove", self.colors["text"])
+            self.font.render_to(self.screen, (pane_x + 18, ay + 52), "Start → Add Script", self.colors["text"])
+            self.font.render_to(self.screen, (pane_x + 18, ay + 80), "S / Y → Settings", self.colors["muted"])
+
+    def render_logs(self):
+        if not self.runner.alive:
+            return
+        lines = self.runner.get_lines(20)
+        if not lines:
+            return
+        w, h = self.screen.get_size()
+        area_h = min(300, h // 3)
+        rect = pygame.Rect(40, h - area_h - 40, w - 80, area_h)
+        self.draw_rounded_rect(self.screen, rect, (10, 12, 14), r=12)
+        # draw lines inside
+        y = rect.top + 12
+        for line in lines:
+            # color errors slightly differently
+            if line.startswith("[ERR]"):
+                color = (255, 160, 140)
+            else:
+                color = self.colors["text"]
+            self.font_small.render_to(self.screen, (rect.left + 10, y), line, color)
+            y += 18
+
+    def render_settings_menu(self):
+        w, h = self.screen.get_size()
+        self.draw_text_center(self.screen, "SETTINGS", (w // 2, 120), self.font_big, self.colors["highlight"])
+        y = 220
+        for i, opt in enumerate(self.settings_options):
+            col = self.colors["highlight"] if i == self.settings_index else self.colors["text"]
+            self.draw_text_center(self.screen, opt, (w // 2, y), self.font, col)
+            y += 56
+
+    def render_footer(self):
+        w, h = self.screen.get_size()
+        footer = "F11:Fullscreen  A: Add  R: Remove  S:Settings  Enter/A:Launch"
+        self.font_small.render_to(self.screen, (w // 2 - self.font_small.get_rect(footer).width // 2, h - 28), footer, self.colors["muted"])
+
+    # ------------------------- Main loop -------------------------
+    def run(self):
+        while self.running:
+            dt = self.clock.tick(FPS) / 1000.0
+            self.screen.fill(self.colors["bg"])
+            # events
+            for event in pygame.event.get():
+                if event.type == QUIT:
+                    self.running = False
+                elif event.type == VIDEORESIZE:
+                    if not self.fullscreen:
+                        self.screen = pygame.display.set_mode((event.w, event.h), RESIZABLE)
+                elif event.type == KEYDOWN:
+                    self.handle_keydown(event.key)
+                elif event.type == JOYBUTTONDOWN:
+                    self.handle_joy_button(event.button)
+                elif event.type == JOYHATMOTION:
+                    self.handle_hat(event.value)
+                elif event.type == JOYAXISMOTION:
+                    self.handle_axis(event.axis, event.value)
+                elif event.type == MOUSEBUTTONDOWN:
+                    # simple mouse handling: click to pick item if clicked near center column
+                    mx, my = event.pos
+                    w, h = self.screen.get_size()
+                    cx = w // 2
+                    # determine item index approximation
+                    item_idx = int(round((my - (h // 2) + self.scroll_y) / (ITEM_H + ITEM_SPACING)))
+                    if 0 <= item_idx < len(self.items):
+                        self.selected_index = item_idx
+                        if event.button == 1:
+                            self.launch_selected()
+
+            # update scroll target
+            self.update_scroll()
+
+            # render main UI
+            if self.in_settings:
+                self.render_settings_menu()
+            else:
+                self.render_carousel()
+                self.render_right_pane()
+                self.render_logs()
+                self.render_footer()
+
+            # save last selection live (so crash won't lose it)
+            if self.items:
+                self.settings["last_selected"] = str(self.items[self.selected_index].path)
+            else:
+                self.settings["last_selected"] = None
+            # present
+            pygame.display.flip()
+
+        # exit cleanup
+        try:
+            save_json(SETTINGS_FILE, self.settings)
+        except Exception:
+            pass
+        try:
+            self.runner.stop()
+        except Exception:
+            pass
+        pygame.quit()
+
+# ------------------------- Run App -------------------------
+if __name__ == "__main__":
+    app = BigPictureLauncher()
+    app.run()
